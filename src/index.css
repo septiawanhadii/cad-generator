@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+:root {
+  --cc-bg: #121417;
+  --cc-surface: #1B1E23;
+  --cc-surface-alt: #242830;
+  --cc-accent: #3B82F6;
+  --cc-accent-muted: #2563EB;
+  --cc-sw-accent: #E11D48;
+  --cc-text: #F1F5F9;
+  --cc-text-muted: #94A3B8;
+  --cc-border: #2E3440;
+  --cc-success: #10B981;
+  --cc-warning: #F59E0B;
+  --cc-error: #EF4444;
+  --cc-info: #06B6D4;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    background-color: var(--cc-bg);
+    color: var(--cc-text);
+    font-family: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle CAD scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #121417;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2E3440;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3D4554;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

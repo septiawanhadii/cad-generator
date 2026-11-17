@@ -1,0 +1,6 @@
+{
+  "name": "CADCraft",
+  "description": "AI Design Assistant & SolidWorks COM Bridge workbench for parametric 2D AutoLISP drafting, DXF cleanup, and 3D .sldprt export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
