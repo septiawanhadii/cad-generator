@@ -12,11 +12,13 @@ import {
   RefreshCw,
   Send,
   Settings,
+  Square,
   Trash2,
   WifiOff,
   X,
 } from 'lucide-react';
 import type {
+  AiProviderKind,
   AssistantTargetMode,
   ChatMessage,
   DocSummary,
@@ -37,6 +39,8 @@ interface AiChatPanelProps {
   docSummary: DocSummary;
   swStatus: SwBridgeStatus;
   isLoading: boolean;
+  activeProvider: AiProviderKind;
+  onCancelRequest: () => void;
   errorMessage: string | null;
   widthPx: number;
   onResizeWidth: (nextWidth: number) => void;
@@ -85,6 +89,8 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
   docSummary,
   swStatus,
   isLoading,
+  activeProvider,
+  onCancelRequest,
   errorMessage,
   widthPx,
   onResizeWidth,
@@ -101,9 +107,22 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
   const [attachment, setAttachment] = useState<PromptAttachment | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
   const scrollEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const resizingRef = useRef(false);
+
+  useEffect(() => {
+    if (!isLoading) {
+      setElapsedSec(0);
+      return;
+    }
+    setElapsedSec(0);
+    const interval = window.setInterval(() => {
+      setElapsedSec((prev) => prev + 1);
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [isLoading]);
 
   useEffect(() => {
     scrollEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -461,9 +480,27 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
         )}
 
         {isLoading && (
-          <div className="flex items-center gap-2 rounded-[10px] border border-[#2E3440] bg-[#1B1E23] px-3 py-2.5 text-xs text-[#94A3B8]">
-            <Loader2 className="h-4 w-4 animate-spin text-[#3B82F6]" />
-            <span>Menyusun geometri CAD...</span>
+          <div className="flex items-center justify-between gap-2 rounded-[10px] border border-[#2E3440] bg-[#1B1E23] px-3 py-2.5 text-xs text-[#94A3B8]">
+            <div className="flex min-w-0 items-center gap-2">
+              <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#3B82F6]" />
+              <span className="truncate">
+                {activeProvider === 'lmstudio'
+                  ? 'LM Studio menyusun CAD...'
+                  : activeProvider === 'ollama'
+                    ? 'Ollama menyusun CAD...'
+                    : 'Menyusun geometri CAD...'}{' '}
+                <span className="font-mono tabular-nums text-[#F1F5F9]">{elapsedSec}s</span>
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={onCancelRequest}
+              aria-label="Hentikan generasi AI"
+              className="flex shrink-0 items-center gap-1 rounded border border-[#2E3440] bg-[#242830] px-2 py-1 text-[11px] font-medium text-[#F1F5F9] transition-colors hover:border-[#EF4444]/60 hover:text-[#EF4444]"
+            >
+              <Square className="h-2.5 w-2.5 fill-current" />
+              <span>Stop</span>
+            </button>
           </div>
         )}
 

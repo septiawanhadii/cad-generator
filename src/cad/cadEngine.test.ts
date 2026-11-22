@@ -25,6 +25,14 @@ import {
   parseParts3d,
   solveAssemblyKinematics,
 } from './cad3dModel';
+import {
+  buildLocalSystemInstruction,
+  formatAiTimeoutError,
+  isTimeoutLikeError,
+  parseOllamaNdjsonStream,
+  parseOpenAiSseStream,
+  resolveProviderTimeoutMs,
+} from './llmStreamParser';
 import { DEFAULT_BRIDGE_CONFIG } from '../types/cadcraft';
 
 test('AutoLISP evaluates mounting plate seed and creates atomic undo group', () => {
@@ -393,6 +401,75 @@ test('Assembly engine infers & parses mates, computes kinematic screw/slide moti
   assert.ok(bom.totalMassGrams > 1500);
   assert.ok(bom.totalVolumeCm3 > 200);
 });
+
+test('llmStreamParser streams LM Studio SSE & Ollama NDJSON cleanly and formats timeout errors', async () => {
+  const encoder = new TextEncoder();
+  const makeReader = (chunks: string[]) => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      },
+    });
+    return stream.getReader();
+  };
+
+  // 1. OpenAI / LM Studio SSE split across arbitrary chunk boundaries with reasoning_content + content
+  let lmActivities = 0;
+  const lmRes = await parseOpenAiSseStream(
+    makeReader([
+      'data: {"model":"qwen3-8b-instruct","choices":[{"delta":{"reasoning_content":"planning..."}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"{\\"explanation\\":\\"OK\\","}}]}\n',
+      'data: {"choices":[{"delta":{"content":"\\"action_type\\":\\"lisp\\"}"}}]}\n\ndata: [DONE]\n',
+    ]),
+    () => {
+      lmActivities += 1;
+    },
+  );
+  assert.equal(lmRes.model, 'qwen3-8b-instruct');
+  assert.equal(lmRes.content, '{"explanation":"OK","action_type":"lisp"}');
+  assert.equal(lmRes.reasoning, 'planning...');
+  assert.equal(lmActivities, 3);
+
+  // 2. Ollama NDJSON streaming
+  let ollamaActivities = 0;
+  const ollamaRes = await parseOllamaNdjsonStream(
+    makeReader([
+      '{"model":"qwen2.5-coder:7b","message":{"content":"{\\"explanation\\":"},"done":false}\n',
+      '{"model":"qwen2.5-coder:7b","message":{"content":"\\"Done\\",\\"action_type\\":\\"lisp\\"}"},"done":true}\n',
+    ]),
+    () => {
+      ollamaActivities += 1;
+    },
+  );
+  assert.equal(ollamaRes.content, '{"explanation":"Done","action_type":"lisp"}');
+  assert.equal(ollamaActivities, 2);
+
+  // 3. Timeout resolver defaults & clamping
+  assert.equal(resolveProviderTimeoutMs('lmstudio'), 300_000);
+  assert.equal(resolveProviderTimeoutMs('ollama'), 300_000);
+  assert.equal(resolveProviderTimeoutMs('gemini'), 75_000);
+  assert.equal(resolveProviderTimeoutMs('lmstudio', 600), 600_000);
+  assert.equal(resolveProviderTimeoutMs('lmstudio', 5), 30_000);
+  assert.equal(resolveProviderTimeoutMs('lmstudio', 5000), 900_000);
+
+  // 4. Timeout detection & Indonesian diagnostics
+  assert.equal(isTimeoutLikeError(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), true);
+  assert.equal(isTimeoutLikeError(new Error('fetch failed: UND_ERR_HEADERS_TIMEOUT')), true);
+  const errMsg = formatAiTimeoutError('lmstudio', 'qwen3-8b', 300, 'total');
+  assert.ok(errMsg.includes('LM Studio (Local)'));
+  assert.ok(errMsg.includes('300 detik'));
+  assert.ok(errMsg.includes('Request Timeout'));
+
+  // 5. Compact local prompt stays concise for fast local prefill
+  const localPrompt = buildLocalSystemInstruction('solidworks_3d', 12);
+  assert.ok(localPrompt.length < 2200);
+  assert.ok(localPrompt.includes('parts_3d'));
+  assert.ok(localPrompt.includes('mates'));
+});
+
 
 
 

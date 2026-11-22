@@ -7,6 +7,14 @@ import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { extractJsonFromLlmText, normalizeAiPayload } from './src/cad/aiPayloadParser';
+import {
+  buildLocalSystemInstruction,
+  formatAiTimeoutError,
+  isTimeoutLikeError,
+  parseOllamaNdjsonStream,
+  parseOpenAiSseStream,
+  resolveProviderTimeoutMs,
+} from './src/cad/llmStreamParser';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -203,7 +211,55 @@ async function startServer() {
     }
   });
 
+  function createActivityWatchdog(
+    res: express.Response,
+    totalMs: number,
+    idleMs: number,
+  ) {
+    const controller = new AbortController();
+    let abortReason: 'total' | 'idle' | 'client' | null = null;
+    let idleTimer: NodeJS.Timeout | null = null;
+
+    const totalTimer = setTimeout(() => {
+      abortReason = 'total';
+      controller.abort(new DOMException('Total request timeout exceeded', 'TimeoutError'));
+    }, totalMs);
+
+    const resetIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        abortReason = 'idle';
+        controller.abort(new DOMException('Stream idle timeout exceeded', 'TimeoutError'));
+      }, idleMs);
+    };
+    resetIdle();
+
+    const onClientClose = () => {
+      if (!res.writableEnded) {
+        abortReason = 'client';
+        controller.abort(new DOMException('Client disconnected', 'AbortError'));
+      }
+    };
+    res.on('close', onClientClose);
+
+    return {
+      signal: controller.signal,
+      touch: resetIdle,
+      getReason: () => abortReason,
+      cleanup: () => {
+        clearTimeout(totalTimer);
+        if (idleTimer) clearTimeout(idleTimer);
+        res.off('close', onClientClose);
+      },
+    };
+  }
+
   app.post('/api/ai/design', async (req, res) => {
+    let activeProvider: 'gemini' | 'lmstudio' | 'ollama' = 'gemini';
+    let activeModel = 'gemini-4-hydrogen';
+    let activeTimeoutSec = 75;
+    let activeAbortReason: 'total' | 'idle' | 'client' | null = null;
+
     try {
       const { prompt, mode = 'cad_2d', docSummary, config, imageBase64, imageMimeType } = req.body ?? {};
       if (typeof prompt !== 'string' || !prompt.trim()) {
@@ -225,6 +281,8 @@ async function startServer() {
           : config?.provider === 'ollama'
             ? 'ollama'
             : 'gemini';
+      activeProvider = provider;
+
       const exportDir = typeof config?.export_dir === 'string' && config.export_dir.trim()
         ? config.export_dir.trim()
         : 'C:\\Users\\Engineer\\Documents\\CADCraft';
@@ -233,7 +291,9 @@ async function startServer() {
           ? config.default_extrude_mm
           : 12.0;
 
-      const systemInstruction = buildSystemInstruction(mode, exportDir, defaultExtrudeMm);
+      const totalTimeoutMs = resolveProviderTimeoutMs(provider, config?.request_timeout_sec);
+      activeTimeoutSec = Math.round(totalTimeoutMs / 1000);
+
       const userContext = `Active CAD Document Context:
 ${JSON.stringify(docSummary ?? {}, null, 2)}
 
@@ -243,96 +303,172 @@ ${prompt.trim()}`;
       if (provider === 'lmstudio') {
         const lmUrl = String(config?.lmstudio_url || 'http://localhost:1234').replace(/\/+$/, '');
         const lmModel = String(config?.model || 'local-model').trim() || 'local-model';
-        const lmSystem = `${systemInstruction}
+        activeModel = lmModel;
+        const lmSystem = buildLocalSystemInstruction(mode, defaultExtrudeMm);
+        const idleTimeoutMs = Math.min(totalTimeoutMs, Math.max(150_000, Math.floor(totalTimeoutMs * 0.8)));
+        const watchdog = createActivityWatchdog(res, totalTimeoutMs, idleTimeoutMs);
 
-Return ONLY a valid JSON object matching this exact structure (no extra prose outside JSON):
-{
-  "explanation": "string",
-  "action_type": "lisp" | "cmdline" | "solidworks_3d" | "none",
-  "lisp_code": "string or null",
-  "commands": ["string"] or null,
-  "part_name": "string or null",
-  "extrude_depth_mm": ${defaultExtrudeMm},
-  "fillet_radius_mm": null,
-  "parts_3d": [ { "name": "Base Plate", "kind": "plate", "cx": 0, "cy": 0, "width": 160, "depth": 140, "z_min": 0, "height": 14, "holes": [] } ]
-}`;
+        const callLmStudio = async (includeImage: boolean) => {
+          const userContent = includeImage
+            ? [
+                {
+                  type: 'text',
+                  text: `${userContext}\n\nReproduce the mechanical assembly shown in the attached image in parts_3d, mates, and lisp_code.`,
+                },
+                {
+                  type: 'image_url',
+                  image_url: { url: `data:${imageMimeType};base64,${imageBase64}` },
+                },
+              ]
+            : userContext;
 
-        const lmRes = await fetch(`${lmUrl}/v1/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: AbortSignal.timeout(60000),
-          body: JSON.stringify({
-            model: lmModel,
-            temperature: 0.15,
-            max_tokens: 4096,
-            messages: [
-              { role: 'system', content: lmSystem },
-              { role: 'user', content: userContext },
-            ],
-          }),
-        });
-
-        if (!lmRes.ok) {
-          const text = await lmRes.text();
-          return res.status(502).json({
-            error: `LM Studio error (${lmRes.status}): ${text || 'Pastikan model sudah di-load dan Start Server aktif di LM Studio.'}`,
+          return fetch(`${lmUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'text/event-stream, application/json',
+            },
+            signal: watchdog.signal,
+            body: JSON.stringify({
+              model: lmModel,
+              temperature: 0.15,
+              max_tokens: 6144,
+              stream: true,
+              messages: [
+                { role: 'system', content: lmSystem },
+                { role: 'user', content: userContent },
+              ],
+            }),
           });
-        }
-
-        const lmJson = (await lmRes.json()) as {
-          model?: string;
-          choices?: Array<{ message?: { content?: string } }>;
         };
-        const rawContent = lmJson.choices?.[0]?.message?.content || '';
-        const parsed = normalizeAiPayload(
-          extractJsonFromLlmText(rawContent, mode),
-          exportDir,
-          defaultExtrudeMm,
-          mode,
-        );
-        return res.json({
-          payload: parsed,
-          model: lmJson.model || lmModel,
-          provider: 'lmstudio',
-        });
+
+        try {
+          let lmRes = await callLmStudio(hasImage);
+
+          // If a text-only local model rejects multimodal image_url payloads, retry automatically as text-only
+          if (!lmRes.ok && hasImage && lmRes.status === 400) {
+            const errBody = await lmRes.text();
+            if (/image|vision|multimodal|content|array/i.test(errBody)) {
+              lmRes = await callLmStudio(false);
+            } else {
+              return res.status(502).json({
+                error: `LM Studio error (${lmRes.status}): ${errBody || 'Pastikan model sudah di-load dan Start Server aktif di LM Studio.'}`,
+              });
+            }
+          }
+
+          if (!lmRes.ok) {
+            const text = await lmRes.text();
+            return res.status(502).json({
+              error: `LM Studio error (${lmRes.status}): ${text || 'Pastikan model sudah di-load dan Start Server aktif di LM Studio.'}`,
+            });
+          }
+
+          const contentType = (lmRes.headers.get('content-type') || '').toLowerCase();
+          let rawContent = '';
+          let resolvedModel = lmModel;
+
+          if (contentType.includes('text/event-stream') && lmRes.body) {
+            const streamed = await parseOpenAiSseStream(lmRes.body.getReader(), watchdog.touch);
+            rawContent = streamed.content;
+            if (streamed.model) resolvedModel = streamed.model;
+          } else {
+            const lmJson = (await lmRes.json()) as {
+              model?: string;
+              choices?: Array<{ message?: { content?: string } }>;
+            };
+            rawContent = lmJson.choices?.[0]?.message?.content || '';
+            if (lmJson.model) resolvedModel = lmJson.model;
+          }
+
+          const parsed = normalizeAiPayload(
+            extractJsonFromLlmText(rawContent, mode),
+            exportDir,
+            defaultExtrudeMm,
+            mode,
+          );
+          return res.json({
+            payload: parsed,
+            model: resolvedModel,
+            provider: 'lmstudio',
+          });
+        } catch (err) {
+          activeAbortReason = watchdog.getReason();
+          if (activeAbortReason === 'idle') {
+            activeTimeoutSec = Math.round(idleTimeoutMs / 1000);
+          }
+          throw err;
+        } finally {
+          watchdog.cleanup();
+        }
       }
 
       if (provider === 'ollama') {
         const ollamaUrl = String(config?.ollama_url || 'http://localhost:11434').replace(/\/+$/, '');
         const ollamaModel = String(config?.model || 'qwen2.5-coder:7b');
-        const ollamaRes = await fetch(`${ollamaUrl}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: AbortSignal.timeout(60000),
-          body: JSON.stringify({
-            model: ollamaModel,
-            stream: false,
-            format: 'json',
-            messages: [
-              { role: 'system', content: systemInstruction },
-              { role: 'user', content: userContext },
-            ],
-          }),
-        });
-        if (!ollamaRes.ok) {
-          const text = await ollamaRes.text();
-          return res.status(502).json({
-            error: `Ollama Local error (${ollamaRes.status}): ${text || 'Failed to reach Ollama endpoint.'}`,
+        activeModel = ollamaModel;
+        const ollamaSystem = buildLocalSystemInstruction(mode, defaultExtrudeMm);
+        const idleTimeoutMs = Math.min(totalTimeoutMs, Math.max(150_000, Math.floor(totalTimeoutMs * 0.8)));
+        const watchdog = createActivityWatchdog(res, totalTimeoutMs, idleTimeoutMs);
+
+        try {
+          const userMsg: Record<string, unknown> = { role: 'user', content: userContext };
+          if (hasImage) {
+            userMsg.images = [imageBase64];
+          }
+          const ollamaRes = await fetch(`${ollamaUrl}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: watchdog.signal,
+            body: JSON.stringify({
+              model: ollamaModel,
+              stream: true,
+              format: 'json',
+              messages: [
+                { role: 'system', content: ollamaSystem },
+                userMsg,
+              ],
+            }),
           });
+          if (!ollamaRes.ok) {
+            const text = await ollamaRes.text();
+            return res.status(502).json({
+              error: `Ollama Local error (${ollamaRes.status}): ${text || 'Failed to reach Ollama endpoint.'}`,
+            });
+          }
+
+          let rawContent = '';
+          if (ollamaRes.body) {
+            const streamed = await parseOllamaNdjsonStream(ollamaRes.body.getReader(), watchdog.touch);
+            rawContent = streamed.content;
+          } else {
+            const ollamaJson = (await ollamaRes.json()) as { message?: { content?: string } };
+            rawContent = ollamaJson.message?.content || '{}';
+          }
+
+          const parsed = normalizeAiPayload(
+            extractJsonFromLlmText(rawContent || '{}', mode),
+            exportDir,
+            defaultExtrudeMm,
+            mode,
+          );
+          return res.json({ payload: parsed, model: ollamaModel, provider: 'ollama' });
+        } catch (err) {
+          activeAbortReason = watchdog.getReason();
+          if (activeAbortReason === 'idle') {
+            activeTimeoutSec = Math.round(idleTimeoutMs / 1000);
+          }
+          throw err;
+        } finally {
+          watchdog.cleanup();
         }
-        const ollamaJson = (await ollamaRes.json()) as { message?: { content?: string } };
-        const parsed = normalizeAiPayload(
-          extractJsonFromLlmText(ollamaJson.message?.content || '{}', mode),
-          exportDir,
-          defaultExtrudeMm,
-          mode,
-        );
-        return res.json({ payload: parsed, model: ollamaModel, provider: 'ollama' });
       }
 
+      const systemInstruction = buildSystemInstruction(mode, exportDir, defaultExtrudeMm);
       const ai = getGeminiClient();
       const requestedModel = typeof config?.model === 'string' ? config.model : 'gemini-4-hydrogen';
       const primaryModel = ALLOWED_GEMINI_MODELS.has(requestedModel) ? requestedModel : 'gemini-4-hydrogen';
+      activeModel = primaryModel;
       const candidateModels =
         primaryModel === 'gemini-4-hydrogen'
           ? ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
@@ -351,11 +487,18 @@ Return ONLY a valid JSON object matching this exact structure (no extra prose ou
 
       for (const candidate of candidateModels) {
         try {
+          const perCandidateTimeoutMs =
+            candidate === 'gemini-4-hydrogen'
+              ? Math.max(60_000, totalTimeoutMs)
+              : Math.max(45_000, Math.min(totalTimeoutMs, 60_000));
+          activeModel = candidate;
+          activeTimeoutSec = Math.round(perCandidateTimeoutMs / 1000);
+
           const response = await ai.models.generateContent({
             model: candidate,
             contents: geminiContents,
             config: {
-              abortSignal: AbortSignal.timeout(candidate === 'gemini-4-hydrogen' ? 28000 : 30000),
+              abortSignal: AbortSignal.timeout(perCandidateTimeoutMs),
               systemInstruction,
               responseMimeType: 'application/json',
               responseSchema: AI_RESPONSE_SCHEMA,
@@ -402,6 +545,19 @@ Return ONLY a valid JSON object matching this exact structure (no extra prose ou
 
       return res.json({ payload: parsedPayload, model: usedModel, provider: 'gemini' });
     } catch (err) {
+      if (activeAbortReason === 'client' || res.writableEnded) {
+        return;
+      }
+      if (activeAbortReason === 'total' || activeAbortReason === 'idle' || isTimeoutLikeError(err)) {
+        const timeoutMsg = formatAiTimeoutError(
+          activeProvider,
+          activeModel,
+          activeTimeoutSec,
+          activeAbortReason === 'idle' ? 'idle' : 'total',
+        );
+        console.error('[/api/ai/design TIMEOUT]', timeoutMsg);
+        return res.status(504).json({ error: timeoutMsg });
+      }
       const msg = err instanceof Error ? err.message : 'Failed to process AI design request.';
       console.error('[/api/ai/design]', msg);
       return res.status(500).json({ error: msg });
@@ -533,9 +689,13 @@ Return ONLY a valid JSON object matching this exact structure (no extra prose ou
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`CADCraft server running at http://localhost:${PORT}`);
   });
+  // Allow long-running local LM Studio / Ollama generations without premature Node HTTP drops
+  httpServer.requestTimeout = 0;
+  httpServer.headersTimeout = 960_000;
+  httpServer.keepAliveTimeout = 65_000;
 }
 
 startServer().catch((err) => {

@@ -183,6 +183,7 @@ export interface AiBridgeConfig {
   model: string;
   lmstudio_url: string;
   ollama_url: string;
+  request_timeout_sec: number;
   python_bin: string;
   default_extrude_mm: number;
   export_dir: string;
@@ -194,6 +195,7 @@ export const DEFAULT_BRIDGE_CONFIG: AiBridgeConfig = {
   model: 'gemini-4-hydrogen',
   lmstudio_url: 'http://localhost:1234',
   ollama_url: 'http://localhost:11434',
+  request_timeout_sec: 300,
   python_bin: 'bridge/solidworks/.venv/Scripts/python.exe',
   default_extrude_mm: 12.0,
   export_dir: 'C:\\Users\\Engineer\\Documents\\CADCraft',

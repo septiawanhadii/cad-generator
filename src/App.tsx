@@ -101,6 +101,7 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const activeRequestAbortRef = useRef<AbortController | null>(null);
   const docSummary = useMemo(() => getDocSummary(doc), [doc]);
 
   const showToast = useCallback((msg: string) => {
@@ -289,10 +290,15 @@ export default function App() {
       setMessages((prev) => [...prev, userMsg]);
       setIsLoading(true);
 
+      activeRequestAbortRef.current?.abort();
+      const abortController = new AbortController();
+      activeRequestAbortRef.current = abortController;
+
       try {
         const res = await fetch('/api/ai/design', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: abortController.signal,
           body: JSON.stringify({
             prompt: promptText,
             mode,
@@ -396,13 +402,24 @@ export default function App() {
           });
         }
       } catch (err) {
-        setErrorMessage(err instanceof Error ? err.message : 'Terjadi kesalahan saat memproses prompt.');
+        if (err instanceof Error && err.name === 'AbortError') {
+          setCliLogs((l) => [...l, 'AI REQUEST: Dibatalkan oleh pengguna.']);
+        } else {
+          setErrorMessage(err instanceof Error ? err.message : 'Terjadi kesalahan saat memproses prompt.');
+        }
       } finally {
+        if (activeRequestAbortRef.current === abortController) {
+          activeRequestAbortRef.current = null;
+        }
         setIsLoading(false);
       }
     },
     [mode, docSummary, config, doc, executeSolidWorksExport],
   );
+
+  const handleCancelAiRequest = useCallback(() => {
+    activeRequestAbortRef.current?.abort();
+  }, []);
 
   const handleRunLisp = useCallback((lispCode: string) => {
     setErrorMessage(null);
@@ -724,6 +741,8 @@ export default function App() {
                 docSummary={docSummary}
                 swStatus={swStatus}
                 isLoading={isLoading}
+                activeProvider={config.provider}
+                onCancelRequest={handleCancelAiRequest}
                 errorMessage={errorMessage}
                 widthPx={aiPanelWidth}
                 onResizeWidth={setAiPanelWidth}

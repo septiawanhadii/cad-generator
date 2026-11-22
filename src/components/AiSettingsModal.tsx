@@ -18,6 +18,7 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
 }) => {
   const [draft, setDraft] = useState<AiBridgeConfig>(config);
   const [extrudeInput, setExtrudeInput] = useState(String(config.default_extrude_mm));
+  const [timeoutInput, setTimeoutInput] = useState(String(config.request_timeout_sec ?? 300));
   const [formError, setFormError] = useState<string | null>(null);
   const [testingCom, setTestingCom] = useState(false);
   const [pingResult, setPingResult] = useState<SwPingResult | null>(null);
@@ -30,6 +31,11 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
     const depth = Number(extrudeInput);
     if (!Number.isFinite(depth) || depth <= 0.01 || depth > 10000) {
       setFormError('Ketebalan extrude default harus angka positif antara 0.02 mm dan 10000.0 mm.');
+      return;
+    }
+    const timeoutSec = Math.round(Number(timeoutInput));
+    if (!Number.isFinite(timeoutSec) || timeoutSec < 30 || timeoutSec > 900) {
+      setFormError('Request Timeout harus antara 30 hingga 900 detik.');
       return;
     }
     if (!draft.python_bin.trim()) {
@@ -48,6 +54,7 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
     onSave({
       ...draft,
       default_extrude_mm: depth,
+      request_timeout_sec: timeoutSec,
     });
   };
 
@@ -265,6 +272,28 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
                 </div>
               </div>
             )}
+
+            <div>
+              <label htmlFor="cfg-timeout-sec" className="block text-xs font-medium text-[#F1F5F9]">
+                Request Timeout (detik)
+              </label>
+              <input
+                id="cfg-timeout-sec"
+                type="number"
+                min={30}
+                max={900}
+                step={15}
+                value={timeoutInput}
+                onChange={(e) => {
+                  setTimeoutInput(e.target.value);
+                  if (formError) setFormError(null);
+                }}
+                className="mt-1 w-full rounded-md border border-[#2E3440] bg-[#121417] px-3 py-2 font-mono text-xs text-[#F1F5F9] tabular-nums focus:border-[#3B82F6] focus:outline-none"
+              />
+              <p className="mt-1 text-[11px] leading-relaxed text-[#94A3B8]">
+                Default 300 detik (5 menit) dengan streaming aktif agar model lokal LM Studio / Ollama tidak timeout saat menyusun 3D assembly.
+              </p>
+            </div>
           </div>
 
           <div className="h-px bg-[#2E3440]" />
