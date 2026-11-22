@@ -1,10 +1,12 @@
 import 'dotenv/config';
 import express from 'express';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { extractJsonFromLlmText, normalizeAiPayload } from './src/cad/aiPayloadParser';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,64 +56,92 @@ const AI_RESPONSE_SCHEMA = {
       items: { type: Type.STRING },
       description: 'Optional list of CAD command-line instructions like OVERKILL or JOIN.',
     },
-    solidworks_spec: {
-      type: Type.OBJECT,
+    part_name: {
+      type: Type.STRING,
       nullable: true,
-      properties: {
-        part_name: { type: Type.STRING },
-        source_mode: { type: Type.STRING },
-        dxf_temp_path: { type: Type.STRING, nullable: true },
-        extrude_depth_mm: { type: Type.NUMBER },
-        fillet_radius_mm: { type: Type.NUMBER, nullable: true },
-        output_sldprt_path: { type: Type.STRING },
-        entities: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              kind: { type: Type.STRING },
-              width_mm: { type: Type.NUMBER, nullable: true },
-              height_mm: { type: Type.NUMBER, nullable: true },
-              cx_mm: { type: Type.NUMBER, nullable: true },
-              cy_mm: { type: Type.NUMBER, nullable: true },
-              radius_mm: { type: Type.NUMBER, nullable: true },
-            },
-            required: ['kind'],
-          },
-        },
-      },
-      required: ['part_name', 'source_mode', 'extrude_depth_mm', 'entities', 'output_sldprt_path'],
+      description: 'Snake_case part name for SolidWorks export (e.g. drill_press_vise_base).',
+    },
+    extrude_depth_mm: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Extrusion depth in millimeters (e.g. 15).',
+    },
+    fillet_radius_mm: {
+      type: Type.NUMBER,
+      nullable: true,
+      description: 'Optional fillet radius in millimeters.',
+    },
+    parts_3d_json: {
+      type: Type.STRING,
+      nullable: true,
+      description:
+        'Compact JSON array string of multi-level 3D CAD solid parts (plate with holes, prism, box, oriented/threaded cylinder) in mm so the 3D viewport and SolidWorks COM bridge render an accurate 3D solid assembly.',
+    },
+    mates_json: {
+      type: Type.STRING,
+      nullable: true,
+      description:
+        'Optional compact JSON array string of SolidWorks Assembly Mates linking parts_3d components (coincident, concentric, screw, slide) with axis and travel_mm/pitch_mm for kinematic motion simulation.',
     },
   },
   required: ['explanation', 'action_type'],
 };
 
 function buildSystemInstruction(mode: string, exportDir: string, defaultExtrudeMm: number): string {
-  return `You are CADCraft AI Design Assistant, a precision mechanical CAD and SolidWorks automation engineer.
-You translate natural language mechanical design requests into deterministic AutoLISP scripts for CADCraft 2D and SolidWorksBuildSpec JSON for 3D .sldprt export.
+  return `You are CADCraft AI Design Assistant, a senior SolidWorks & mechanical CAD systems engineer.
+You translate natural language mechanical design requests (and optional reference images) into BOTH:
+1. Accurate 2D plan-view AutoLISP (lisp_code) for CADCraft 2D canvas.
+2. Accurate multi-level, multi-part parametric 3D solid assembly features (parts_3d_json) in millimeters (mm) for SolidWorks 3D & real-time PBR rendering.
 
 Target mode: ${mode === 'solidworks_3d' ? '2D + 3D SolidWorks (.sldprt)' : '2D CADCraft'}.
-Units: Always use millimeters (mm).
+Units: Always use millimeters (mm), centered symmetrically around X=0, Y=0, with the bottom resting at Z=0.
 Default extrude depth: ${defaultExtrudeMm} mm.
 Default export directory: ${exportDir}
 
-Supported AutoLISP commands in CADCraft:
+Supported AutoLISP commands in CADCraft 2D:
 - (progn ...)
 - (command "_RECTANG" '(x1 y1) '(x2 y2))
 - (command "_CIRCLE" '(cx cy) radius)  [NOTE: pass RADIUS, not diameter!]
 - (command "_LINE" '(x1 y1) '(x2 y2))
 - (command "_PLINE" '(x1 y1) '(x2 y2) '(x3 y3) "C")
 - (command "_ARC" '(cx cy) radius startDeg endDeg)
-- (command "OVERKILL")  [deduplicate overlapping geometry]
-- (command "JOIN")      [join contiguous line segments into closed polylines]
-- (command "CLEAR")     [clear canvas]
+- (command "_SLOT" '(x1 y1) '(x2 y2) width)  [obround slot between 2 centers]
+- (command "_POLYGON" '(cx cy) radius sides)
+- (command "OVERKILL")
+- (command "JOIN")
+- (command "CLEAR")
 
-Rules:
-1. Always return strict JSON matching the schema.
-2. When drawing a part (like a mounting plate, bracket, flange, or gear blank), use clear coordinates starting from (0,0) or centered symmetrically, and make sure hole radii are diameter / 2 (e.g. M6 clearance hole = radius 3 or 3.3, diameter 30mm bore = radius 15).
-3. If the user asks to clean up the sketch (OVERKILL + JOIN), set action_type to "lisp" with "(progn (command \"OVERKILL\") (command \"JOIN\"))" or action_type "cmdline" with commands ["OVERKILL", "JOIN"].
-4. If target mode is "solidworks_3d" OR the user asks to extrude / export to 3D / .sldprt, set action_type to "solidworks_3d", include lisp_code if new 2D geometry is requested (or null if extruding existing canvas), and provide a complete solidworks_spec with valid part_name, extrude_depth_mm, entities, source_mode ("parametric_primitives" or "from_active_dxf"), and output_sldprt_path.
-5. Reply in the same language as the user's prompt (Indonesian or English), keeping explanations concise and technically accurate.`;
+3D SOLID FEATURE SCHEMA for "parts_3d_json" (MUST be a valid compact JSON array string whenever generating 3D parts or mechanical objects):
+Coordinate system: X = width (left/right), Y = depth (front/back), Z = height (up from 0).
+Supported part kinds:
+1. "plate" (base/flange with real boolean through-holes/cutouts):
+   {"name":"Base Plate","kind":"plate","cx":0,"cy":0,"width":160,"depth":140,"z_min":0,"height":14,"finish":"dark_oxide","holes":[{"kind":"slot","x1":-66,"y1":-48,"x2":-66,"y2":48,"width":12},{"kind":"slot","x1":66,"y1":-48,"x2":66,"y2":48,"width":12},{"kind":"rect","cx":0,"cy":6,"width":36,"height":68}]}
+2. "box" (stepped jaw, rib, guide rail, mounting foot, rear nut block):
+   {"name":"Rear Nut Block","kind":"box","cx":0,"cy":56,"z_min":14,"width":96,"depth":22,"height":24,"finish":"dark_oxide"}
+3. "prism" (extruded custom 2D XY polygon for chamfered jaws, V-groove jaws, triangular blocks, gussets, brackets):
+   {"name":"Movable V-Jaw","kind":"prism","points":[[-44,-46],[44,-46],[44,-24],[18,-10],[-18,-10],[-44,-24]],"z_min":14,"height":26,"finish":"dark_oxide","holes":[{"kind":"circle","cx":0,"cy":-28,"radius":4}]}
+4. "cylinder" (horizontal/vertical shafts, threaded lead screws, handles, pins, bosses; axis="x"|"y"|"z"):
+   {"name":"Lead Screw","kind":"cylinder","cx":0,"cy":24,"cz":26,"radius":6,"length":92,"axis":"y","threaded":true,"finish":"dark_oxide"}
+   {"name":"Handle Grip","kind":"cylinder","cx":0,"cy":96,"cz":26,"radius":8,"length":44,"axis":"y","threaded":false,"finish":"dark_oxide"}
+
+Available finishes: "dark_oxide", "cast_iron", "machined_steel", "aluminum", "brass", "anodized_blue".
+Optional part role: "fixed" | "moving" | "shaft" | "actuator" | "fastener".
+
+ASSEMBLY MATES SCHEMA for "mates_json" (compact JSON array string when generating 2+ part assemblies):
+- [{"kind":"coincident","part_a":"Rear Nut Block","part_b":"Base Plate","axis":"z","description":"Rear Nut Block flush on Base Plate"},
+   {"kind":"slide","part_a":"Movable V-Jaw","part_b":"Base Plate","axis":"y","travel_mm":28,"description":"Movable V-Jaw slides along Y"},
+   {"kind":"screw","part_a":"Lead Screw","part_b":"Rear Nut Block","axis":"y","travel_mm":28,"pitch_mm":4,"description":"Lead Screw M16x4 drives Movable V-Jaw"},
+   {"kind":"concentric","part_a":"Handle Grip","part_b":"Lead Screw","axis":"y","travel_mm":28,"pitch_mm":4,"description":"Handle concentric with Lead Screw"}]
+
+CRITICAL 3D MECHANICAL ACCURACY RULES:
+1. NEVER squash a multi-part mechanical assembly (like a Drill Press Vise, bracket, clamp, gearbox, flanged shaft, pillow block, arbor press) into a single flat extrusion! Use 4–12 properly stacked 3D parts in "parts_3d_json" with realistic Z elevations (e.g. base plate z_min=0..14, jaws/blocks sitting FLUSH on z_min=14..40, horizontal lead screw centered at cz=26 passing through the rear block and connecting to the movable jaw, handle extending cleanly behind the rear block).
+2. Put mounting slots, center through-openings, and bolt holes INSIDE the plate's "holes" array so they render as true see-through cutouts (do NOT make holes into overlapping solid boxes!).
+3. For a Drill Press Vise / Ragum Bor specifically: include (a) flanged base plate with left & right obround mounting slots and central rectangular through-opening, (b) recessed front/back bottom guide rails or stepped wings, (c) front jaw with diagonal V-groove / chamfered triangular cheek blocks using "prism" polygons, (d) stepped rear fixed nut block using stacked "box" features, (e) horizontal "threaded": true lead screw along Y axis ("axis":"y") spanning between front jaw and rear block, and (f) thicker cylindrical handle extending smoothly past the rear block.
+4. Whenever generating a multi-part assembly (2+ parts), populate BOTH "parts_3d_json" (with accurate "role") AND "mates_json" so the user gets full SolidWorks Assembly Tree, Mates, BOM, Kinematic Motion Simulation, and .sldasm export.
+5. Keep explanation concise (1-2 sentences) and lisp_code on one clean line matching the XY plan projection of the part.
+6. Make sure hole radii are diameter / 2.
+7. If target mode is "solidworks_3d" OR the user asks for 3D / .sldprt / .sldasm / assembly / extrude / model 3D, set action_type to "solidworks_3d", set part_name (snake_case), extrude_depth_mm, AND populate "parts_3d_json" + "mates_json".
+8. Reply in the same language as the user's prompt (Indonesian or English).`;
 }
 
 function readBridgeFiles() {
@@ -129,7 +159,7 @@ function readBridgeFiles() {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '10mb' }));
 
   app.get('/api/health', (_req, res) => {
     const hasGeminiKey = Boolean(
@@ -147,9 +177,35 @@ async function startServer() {
     res.json(readBridgeFiles());
   });
 
+  app.post('/api/ai/lmstudio/models', async (req, res) => {
+    try {
+      const lmUrl = String(req.body?.lmstudio_url || 'http://localhost:1234').replace(/\/+$/, '');
+      const resp = await fetch(`${lmUrl}/v1/models`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!resp.ok) {
+        return res.status(502).json({
+          ok: false,
+          models: [],
+          error: `LM Studio merespons HTTP ${resp.status}. Pastikan Local Server di LM Studio sudah aktif.`,
+        });
+      }
+      const data = (await resp.json()) as { data?: Array<{ id: string }> };
+      const models = Array.isArray(data.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
+      return res.json({ ok: true, models });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal terhubung ke LM Studio.';
+      return res.status(502).json({
+        ok: false,
+        models: [],
+        error: `Tidak dapat menghubungi LM Studio (${msg}). Pastikan "Start Server" aktif di port 1234.`,
+      });
+    }
+  });
+
   app.post('/api/ai/design', async (req, res) => {
     try {
-      const { prompt, mode = 'cad_2d', docSummary, config } = req.body ?? {};
+      const { prompt, mode = 'cad_2d', docSummary, config, imageBase64, imageMimeType } = req.body ?? {};
       if (typeof prompt !== 'string' || !prompt.trim()) {
         return res.status(400).json({ error: 'Prompt tidak boleh kosong.' });
       }
@@ -157,7 +213,18 @@ async function startServer() {
         return res.status(400).json({ error: 'Prompt melebihi batas maksimal 4.000 karakter.' });
       }
 
-      const provider = config?.provider === 'ollama' ? 'ollama' : 'gemini';
+      const hasImage =
+        typeof imageBase64 === 'string' &&
+        imageBase64.length > 32 &&
+        typeof imageMimeType === 'string' &&
+        imageMimeType.startsWith('image/');
+
+      const provider =
+        config?.provider === 'lmstudio'
+          ? 'lmstudio'
+          : config?.provider === 'ollama'
+            ? 'ollama'
+            : 'gemini';
       const exportDir = typeof config?.export_dir === 'string' && config.export_dir.trim()
         ? config.export_dir.trim()
         : 'C:\\Users\\Engineer\\Documents\\CADCraft';
@@ -173,12 +240,70 @@ ${JSON.stringify(docSummary ?? {}, null, 2)}
 User Design Request:
 ${prompt.trim()}`;
 
+      if (provider === 'lmstudio') {
+        const lmUrl = String(config?.lmstudio_url || 'http://localhost:1234').replace(/\/+$/, '');
+        const lmModel = String(config?.model || 'local-model').trim() || 'local-model';
+        const lmSystem = `${systemInstruction}
+
+Return ONLY a valid JSON object matching this exact structure (no extra prose outside JSON):
+{
+  "explanation": "string",
+  "action_type": "lisp" | "cmdline" | "solidworks_3d" | "none",
+  "lisp_code": "string or null",
+  "commands": ["string"] or null,
+  "part_name": "string or null",
+  "extrude_depth_mm": ${defaultExtrudeMm},
+  "fillet_radius_mm": null,
+  "parts_3d": [ { "name": "Base Plate", "kind": "plate", "cx": 0, "cy": 0, "width": 160, "depth": 140, "z_min": 0, "height": 14, "holes": [] } ]
+}`;
+
+        const lmRes = await fetch(`${lmUrl}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(60000),
+          body: JSON.stringify({
+            model: lmModel,
+            temperature: 0.15,
+            max_tokens: 4096,
+            messages: [
+              { role: 'system', content: lmSystem },
+              { role: 'user', content: userContext },
+            ],
+          }),
+        });
+
+        if (!lmRes.ok) {
+          const text = await lmRes.text();
+          return res.status(502).json({
+            error: `LM Studio error (${lmRes.status}): ${text || 'Pastikan model sudah di-load dan Start Server aktif di LM Studio.'}`,
+          });
+        }
+
+        const lmJson = (await lmRes.json()) as {
+          model?: string;
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        const rawContent = lmJson.choices?.[0]?.message?.content || '';
+        const parsed = normalizeAiPayload(
+          extractJsonFromLlmText(rawContent, mode),
+          exportDir,
+          defaultExtrudeMm,
+          mode,
+        );
+        return res.json({
+          payload: parsed,
+          model: lmJson.model || lmModel,
+          provider: 'lmstudio',
+        });
+      }
+
       if (provider === 'ollama') {
         const ollamaUrl = String(config?.ollama_url || 'http://localhost:11434').replace(/\/+$/, '');
         const ollamaModel = String(config?.model || 'qwen2.5-coder:7b');
         const ollamaRes = await fetch(`${ollamaUrl}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(60000),
           body: JSON.stringify({
             model: ollamaModel,
             stream: false,
@@ -196,7 +321,12 @@ ${prompt.trim()}`;
           });
         }
         const ollamaJson = (await ollamaRes.json()) as { message?: { content?: string } };
-        const parsed = JSON.parse(ollamaJson.message?.content || '{}');
+        const parsed = normalizeAiPayload(
+          extractJsonFromLlmText(ollamaJson.message?.content || '{}', mode),
+          exportDir,
+          defaultExtrudeMm,
+          mode,
+        );
         return res.json({ payload: parsed, model: ollamaModel, provider: 'ollama' });
       }
 
@@ -208,19 +338,28 @@ ${prompt.trim()}`;
           ? ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
           : [primaryModel];
 
-      let responseText = '';
+      let parsedPayload: Record<string, unknown> | null = null;
       let usedModel = primaryModel;
       let lastErr: unknown = null;
+
+      const geminiContents = hasImage
+        ? [
+            { text: `${userContext}\n\nAnalyze the attached mechanical reference image carefully and reproduce its true 3D proportions, stepped elevations, slots/cutouts, angled jaws, and cylindrical shafts/handles in parts_3d_json and lisp_code.` },
+            { inlineData: { mimeType: imageMimeType, data: imageBase64 } },
+          ]
+        : userContext;
 
       for (const candidate of candidateModels) {
         try {
           const response = await ai.models.generateContent({
             model: candidate,
-            contents: userContext,
+            contents: geminiContents,
             config: {
+              abortSignal: AbortSignal.timeout(candidate === 'gemini-4-hydrogen' ? 28000 : 30000),
               systemInstruction,
               responseMimeType: 'application/json',
               responseSchema: AI_RESPONSE_SCHEMA,
+              maxOutputTokens: 16384,
               thinkingConfig: {
                 thinkingLevel:
                   candidate === 'gemini-3.1-flash-lite'
@@ -229,26 +368,39 @@ ${prompt.trim()}`;
               },
             },
           });
-          responseText = (response.text ?? '').trim();
+          const responseText = (response.text ?? '').trim();
+          if (!responseText) {
+            throw new Error(`Empty response from ${candidate}`);
+          }
+          const rawParsed = extractJsonFromLlmText(responseText, mode);
+          parsedPayload = normalizeAiPayload(rawParsed, exportDir, defaultExtrudeMm, mode);
           usedModel = candidate;
-          if (responseText) break;
+          break;
         } catch (err) {
           lastErr = err;
-          const errStr = err instanceof Error ? err.message : String(err);
-          const isTransient = errStr.includes('503') || errStr.includes('UNAVAILABLE') || errStr.includes('429');
-          if (!isTransient) {
+          const errStr = err instanceof Error ? `${err.name} ${err.message}` : String(err);
+          const isRecoverable =
+            errStr.includes('503') ||
+            errStr.includes('UNAVAILABLE') ||
+            errStr.includes('429') ||
+            errStr.includes('TimeoutError') ||
+            errStr.includes('AbortError') ||
+            errStr.includes('Empty response') ||
+            errStr.includes('AiResponsePayload') ||
+            errStr.toLowerCase().includes('aborted') ||
+            errStr.toLowerCase().includes('timeout');
+          if (!isRecoverable) {
             throw err;
           }
         }
       }
 
-      if (!responseText) {
+      if (!parsedPayload) {
         if (lastErr) throw lastErr;
         return res.status(502).json({ error: 'Gemini returned an empty response.' });
       }
 
-      const payload = JSON.parse(responseText);
-      return res.json({ payload, model: usedModel, provider: 'gemini' });
+      return res.json({ payload: parsedPayload, model: usedModel, provider: 'gemini' });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to process AI design request.';
       console.error('[/api/ai/design]', msg);
@@ -321,7 +473,7 @@ ${prompt.trim()}`;
       return res.status(400).json({ error: 'Payload DXF tidak valid.' });
     }
 
-    const exportTmpDir = path.resolve('/tmp', 'cadcraft_exports');
+    const exportTmpDir = path.join(os.tmpdir(), 'cadcraft_exports');
     fs.mkdirSync(exportTmpDir, { recursive: true });
 
     const safeName = String(spec.part_name || 'cadcraft_part').replace(/[^a-zA-Z0-9_-]/g, '_');

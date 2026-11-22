@@ -226,6 +226,10 @@ export function evaluateAutoLisp(input: string, initialDoc: DocState): LispEvalR
 
     if (expr.items.length === 0) return null;
     const head = expr.items[0];
+    if (head.kind === 'number') {
+      // Allow unquoted numeric point lists like (10 20) or (10 20 0)
+      return expr.items.map(evalExpr);
+    }
     if (head.kind !== 'symbol') {
       throw new Error('First element of AutoLISP list must be a function symbol.');
     }
@@ -286,10 +290,10 @@ export function evaluateAutoLisp(input: string, initialDoc: DocState): LispEvalR
       const evaluated = args.map(evalExpr);
       const rawCmd = String(evaluated[0] ?? '')
         .trim()
-        .replace(/^_/, '')
+        .replace(/^_+/, '')
         .toUpperCase();
 
-      if (rawCmd === 'RECTANG' || rawCmd === 'RECTANGLE') {
+      if (rawCmd === 'RECTANG' || rawCmd === 'RECTANGLE' || rawCmd === 'BOX') {
         const p1 = toPoint2D(evaluated[1], 'RECTANG corner 1');
         const p2 = toPoint2D(evaluated[2], 'RECTANG corner 2');
         const ent: CadEntity = {
@@ -307,9 +311,15 @@ export function evaluateAutoLisp(input: string, initialDoc: DocState): LispEvalR
         return 'RECTANG';
       }
 
-      if (rawCmd === 'CIRCLE') {
+      if (rawCmd === 'CIRCLE' || rawCmd === 'CYLINDER') {
         const center = toPoint2D(evaluated[1], 'CIRCLE center');
-        const radius = toNumber(evaluated[2], 'CIRCLE radius');
+        let radius: number;
+        const second = evaluated[2];
+        if (typeof second === 'string' && second.replace(/^_+/, '').toUpperCase() === 'D') {
+          radius = toNumber(evaluated[3], 'CIRCLE diameter') / 2.0;
+        } else {
+          radius = toNumber(second, 'CIRCLE radius');
+        }
         if (radius <= 0) throw new Error('CIRCLE radius must be > 0.');
         const ent: CadEntity = {
           id: createEntityId('circ'),
@@ -330,6 +340,10 @@ export function evaluateAutoLisp(input: string, initialDoc: DocState): LispEvalR
         for (let i = 1; i < evaluated.length; i++) {
           const v = evaluated[i];
           if (v === null || v === '') break;
+          if (typeof v === 'string' && ['C', '_C', 'CLOSE', '_CLOSE'].includes(v.toUpperCase())) {
+            if (pts.length >= 2) pts.push({ ...pts[0] });
+            break;
+          }
           pts.push(toPoint2D(v, `LINE point ${i}`));
         }
         if (pts.length < 2) {
@@ -358,7 +372,7 @@ export function evaluateAutoLisp(input: string, initialDoc: DocState): LispEvalR
         let closed = false;
         for (let i = 1; i < evaluated.length; i++) {
           const v = evaluated[i];
-          if (typeof v === 'string' && v.toUpperCase() === 'C') {
+          if (typeof v === 'string' && ['C', '_C', 'CLOSE', '_CLOSE'].includes(v.toUpperCase())) {
             closed = true;
             break;
           }
@@ -401,6 +415,59 @@ export function evaluateAutoLisp(input: string, initialDoc: DocState): LispEvalR
         return 'ARC';
       }
 
+      if (rawCmd === 'SLOT') {
+        const p1 = toPoint2D(evaluated[1], 'SLOT start');
+        const p2 = toPoint2D(evaluated[2], 'SLOT end');
+        const width = Math.max(0.5, toNumber(evaluated[3] ?? 10, 'SLOT width'));
+        const r = width / 2;
+        const dx = p2.x - p1.x;
+        const dy = p2.y - p1.y;
+        const baseAngle = Math.atan2(dy, dx);
+        const pts: Point2D[] = [];
+        const steps = 10;
+        for (let i = 0; i <= steps; i++) {
+          const a = baseAngle + Math.PI / 2 + (i / steps) * Math.PI;
+          pts.push({ x: p1.x + Math.cos(a) * r, y: p1.y + Math.sin(a) * r });
+        }
+        for (let i = 0; i <= steps; i++) {
+          const a = baseAngle - Math.PI / 2 + (i / steps) * Math.PI;
+          pts.push({ x: p2.x + Math.cos(a) * r, y: p2.y + Math.sin(a) * r });
+        }
+        const ent: CadEntity = {
+          id: createEntityId('slot'),
+          kind: 'polyline',
+          layer: doc.activeLayer,
+          points: pts,
+          closed: true,
+        };
+        doc = { ...doc, entities: [...doc.entities, ent] };
+        addedCount += 1;
+        logs.push(`SLOT (${p1.x},${p1.y})->(${p2.x},${p2.y}) W=${width}`);
+        return 'SLOT';
+      }
+
+      if (rawCmd === 'POLYGON') {
+        const center = toPoint2D(evaluated[1], 'POLYGON center');
+        const radius = toNumber(evaluated[2], 'POLYGON radius');
+        const sides = Math.max(3, Math.round(toNumber(evaluated[3] ?? 6, 'POLYGON sides')));
+        const pts: Point2D[] = [];
+        for (let i = 0; i < sides; i++) {
+          const a = (i / sides) * Math.PI * 2;
+          pts.push({ x: center.x + Math.cos(a) * radius, y: center.y + Math.sin(a) * radius });
+        }
+        const ent: CadEntity = {
+          id: createEntityId('poly'),
+          kind: 'polyline',
+          layer: doc.activeLayer,
+          points: pts,
+          closed: true,
+        };
+        doc = { ...doc, entities: [...doc.entities, ent] };
+        addedCount += 1;
+        logs.push(`POLYGON sides=${sides} R=${radius}`);
+        return 'POLYGON';
+      }
+
       if (rawCmd === 'OVERKILL') {
         const res = runOverkill(doc);
         doc = res.doc;
@@ -432,6 +499,11 @@ export function evaluateAutoLisp(input: string, initialDoc: DocState): LispEvalR
         };
         logs.push(`CLAYER=${layerName}`);
         return layerName;
+      }
+
+      if (['ZOOM', 'REGEN', 'UNITS', 'FILLET', 'CHAMFER', 'TEXT', 'MTEXT', 'DIMLINEAR'].includes(rawCmd)) {
+        logs.push(`${rawCmd} acknowledged`);
+        return rawCmd;
       }
 
       throw new Error(`Unsupported CAD command in AutoLISP: "${rawCmd}"`);

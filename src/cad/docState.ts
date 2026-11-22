@@ -21,6 +21,8 @@ export function cloneEntities(entities: CadEntity[]): CadEntity[] {
 export function createInitialDocState(): DocState {
   return {
     entities: [],
+    parts3d: [],
+    mates: [],
     layers: [
       { name: '0', color: '#F1F5F9', visible: true },
       { name: 'CUTOUTS', color: '#06B6D4', visible: true },
@@ -312,6 +314,8 @@ export function getDocSummary(doc: DocState): DocSummary {
     return {
       activeLayer: doc.activeLayer,
       entityCount: 0,
+      parts3dCount: doc.parts3d.length,
+      matesCount: doc.mates.length,
       unit: doc.unit,
       extents: null,
       extrudeDepthMm: doc.extrudeDepthMm,
@@ -336,6 +340,8 @@ export function getDocSummary(doc: DocState): DocSummary {
   return {
     activeLayer: doc.activeLayer,
     entityCount: doc.entities.length,
+    parts3dCount: doc.parts3d.length,
+    matesCount: doc.mates.length,
     unit: doc.unit,
     extents: {
       minX: Math.round(minX * 100) / 100,

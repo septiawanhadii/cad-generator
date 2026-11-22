@@ -21,6 +21,9 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
   const [formError, setFormError] = useState<string | null>(null);
   const [testingCom, setTestingCom] = useState(false);
   const [pingResult, setPingResult] = useState<SwPingResult | null>(null);
+  const [lmModels, setLmModels] = useState<string[]>([]);
+  const [testingLm, setTestingLm] = useState(false);
+  const [lmStatusMsg, setLmStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
@@ -31,6 +34,10 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
     }
     if (!draft.python_bin.trim()) {
       setFormError('Path executable Python tidak boleh kosong.');
+      return;
+    }
+    if (draft.provider === 'lmstudio' && !draft.lmstudio_url.trim()) {
+      setFormError('URL server LM Studio wajib diisi (default: http://localhost:1234).');
       return;
     }
     if (draft.provider === 'ollama' && !draft.ollama_url.trim()) {
@@ -54,6 +61,39 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
     }
   };
 
+  const handleTestLmStudio = async () => {
+    setTestingLm(true);
+    setLmStatusMsg(null);
+    try {
+      const res = await fetch('/api/ai/lmstudio/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lmstudio_url: draft.lmstudio_url }),
+      });
+      const data = (await res.json()) as { ok: boolean; models?: string[]; error?: string };
+      if (!res.ok || !data.ok) {
+        setLmModels([]);
+        setLmStatusMsg({ ok: false, text: data.error || 'LM Studio tidak merespons.' });
+        return;
+      }
+      const list = data.models || [];
+      setLmModels(list);
+      if (list.length > 0) {
+        setDraft((prev) => ({ ...prev, model: list[0] }));
+        setLmStatusMsg({ ok: true, text: `Terhubung! ${list.length} model aktif terdeteksi.` });
+      } else {
+        setLmStatusMsg({
+          ok: true,
+          text: 'Server LM Studio aktif, tetapi belum ada model yang di-load di LM Studio.',
+        });
+      }
+    } catch {
+      setLmStatusMsg({ ok: false, text: 'Gagal memeriksa endpoint LM Studio.' });
+    } finally {
+      setTestingLm(false);
+    }
+  };
+
   return (
     <div
       role="dialog"
@@ -65,7 +105,7 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
         initial={{ opacity: 0, scale: 0.98 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.12 }}
-        className="w-full max-w-[440px] rounded-[10px] border border-[#2E3440] bg-[#1B1E23] shadow-xl"
+        className="w-full max-w-[440px] max-h-[92vh] overflow-y-auto rounded-[10px] border border-[#2E3440] bg-[#1B1E23] shadow-xl"
       >
         <div className="flex items-center justify-between border-b border-[#2E3440] px-4 py-3">
           <h2 id="ai-settings-title" className="text-[15px] font-semibold text-[#F1F5F9]">
@@ -94,16 +134,25 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
                 id="cfg-provider"
                 value={draft.provider}
                 onChange={(e) => {
-                  const p = e.target.value === 'ollama' ? 'ollama' : 'gemini';
+                  const val = e.target.value;
+                  const p = val === 'lmstudio' ? 'lmstudio' : val === 'ollama' ? 'ollama' : 'gemini';
+                  setFormError(null);
+                  setLmStatusMsg(null);
                   setDraft({
                     ...draft,
                     provider: p,
-                    model: p === 'gemini' ? 'gemini-4-hydrogen' : 'qwen2.5-coder:7b',
+                    model:
+                      p === 'gemini'
+                        ? 'gemini-4-hydrogen'
+                        : p === 'lmstudio'
+                          ? 'qwen2.5-coder-7b-instruct'
+                          : 'qwen2.5-coder:7b',
                   });
                 }}
                 className="mt-1 w-full rounded-md border border-[#2E3440] bg-[#121417] px-3 py-2 text-xs text-[#F1F5F9] focus:border-[#3B82F6] focus:outline-none"
               >
                 <option value="gemini">Google Gemini API (Server-Side Managed)</option>
+                <option value="lmstudio">LM Studio (Local Server - port 1234)</option>
                 <option value="ollama">Ollama Local (Offline Workstation)</option>
               </select>
             </div>
@@ -123,6 +172,68 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
                   <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Fast)</option>
                 </select>
               </div>
+            ) : draft.provider === 'lmstudio' ? (
+              <div className="space-y-2.5">
+                <div>
+                  <label htmlFor="cfg-lmstudio-url" className="block text-xs font-medium text-[#F1F5F9]">
+                    LM Studio Server URL
+                  </label>
+                  <input
+                    id="cfg-lmstudio-url"
+                    type="text"
+                    value={draft.lmstudio_url}
+                    onChange={(e) => {
+                      setDraft({ ...draft, lmstudio_url: e.target.value });
+                      if (formError) setFormError(null);
+                    }}
+                    placeholder="http://localhost:1234"
+                    className="mt-1 w-full rounded-md border border-[#2E3440] bg-[#121417] px-3 py-2 font-mono text-xs text-[#F1F5F9] focus:border-[#3B82F6] focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="cfg-lmstudio-model" className="block text-xs font-medium text-[#F1F5F9]">
+                      LM Studio Model ID
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleTestLmStudio}
+                      disabled={testingLm}
+                      className="text-[11px] font-medium text-[#3B82F6] hover:underline disabled:opacity-50"
+                    >
+                      {testingLm ? 'Checking...' : 'Detect Loaded Models'}
+                    </button>
+                  </div>
+                  {lmModels.length > 0 ? (
+                    <select
+                      id="cfg-lmstudio-model"
+                      value={draft.model}
+                      onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                      className="mt-1 w-full rounded-md border border-[#2E3440] bg-[#121417] px-3 py-2 font-mono text-xs text-[#F1F5F9] focus:border-[#3B82F6] focus:outline-none"
+                    >
+                      {lmModels.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      id="cfg-lmstudio-model"
+                      type="text"
+                      value={draft.model}
+                      onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                      placeholder="local-model atau nama model di LM Studio"
+                      className="mt-1 w-full rounded-md border border-[#2E3440] bg-[#121417] px-3 py-2 font-mono text-xs text-[#F1F5F9] focus:border-[#3B82F6] focus:outline-none"
+                    />
+                  )}
+                  {lmStatusMsg && (
+                    <p className={`mt-1 text-[11px] ${lmStatusMsg.ok ? 'text-[#10B981]' : 'text-[#F59E0B]'}`}>
+                      {lmStatusMsg.text}
+                    </p>
+                  )}
+                </div>
+              </div>
             ) : (
               <div className="space-y-2.5">
                 <div>
@@ -133,7 +244,10 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
                     id="cfg-ollama-url"
                     type="text"
                     value={draft.ollama_url}
-                    onChange={(e) => setDraft({ ...draft, ollama_url: e.target.value })}
+                    onChange={(e) => {
+                      setDraft({ ...draft, ollama_url: e.target.value });
+                      if (formError) setFormError(null);
+                    }}
                     className="mt-1 w-full rounded-md border border-[#2E3440] bg-[#121417] px-3 py-2 font-mono text-xs text-[#F1F5F9] focus:border-[#3B82F6] focus:outline-none"
                   />
                 </div>

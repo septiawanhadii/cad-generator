@@ -22,10 +22,11 @@ import {
 } from './cad/docState';
 import { evaluateAutoLisp, executeCmdlineList } from './cad/lispEvaluator';
 import { buildSolidWorksSpecFromDoc, exportDocToDxf } from './cad/dxfExporter';
+import { derive2dEntitiesFromParts3d } from './cad/cad3dModel';
 import { CadCanvas2D } from './components/CadCanvas2D';
 import { SolidWorks3DViewport } from './components/SolidWorks3DViewport';
 import { BridgeFilesPanel } from './components/BridgeFilesPanel';
-import { AiChatPanel } from './components/AiChatPanel';
+import { AiChatPanel, type PromptAttachment } from './components/AiChatPanel';
 import { AiSettingsModal } from './components/AiSettingsModal';
 import { CommandLineBar } from './components/CommandLineBar';
 
@@ -93,6 +94,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastPrompt, setLastPrompt] = useState<string | null>(null);
+  const [lastAttachment, setLastAttachment] = useState<PromptAttachment | undefined>(undefined);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [swStatus, setSwStatus] = useState<SwBridgeStatus>('offline');
   const [cliLogs, setCliLogs] = useState<string[]>([]);
@@ -195,10 +197,10 @@ export default function App() {
   const handleClearCanvas = useCallback(() => {
     setDoc((prev) => {
       const grouped = beginUndoGroup(prev);
-      const cleared = { ...grouped, entities: [] };
+      const cleared = { ...grouped, entities: [], parts3d: [], mates: [] };
       return endUndoGroup(cleared);
     });
-    setCliLogs((l) => [...l, 'CLEAR: Kanvas dibersihkan (dapat dibatalkan via Undo).']);
+    setCliLogs((l) => [...l, 'CLEAR: Kanvas 2D & rakitan 3D dibersihkan (dapat dibatalkan via Undo).']);
   }, []);
 
   const executeSolidWorksExport = useCallback(
@@ -227,25 +229,36 @@ export default function App() {
         throw new Error(data.error || 'Gagal mengekspor ke SolidWorks COM Bridge.');
       }
 
+      const isAsm = spec.output_mode === 'assembly' && Boolean(spec.output_sldasm_path);
+      const primaryOutputPath = isAsm
+        ? spec.output_sldasm_path!
+        : spec.output_sldprt_path;
+
       const sysMsg: ChatMessage = {
         id: `sys-${Date.now()}`,
         created_at: new Date().toISOString(),
         role: 'SystemTool',
         content: data.message,
         lisp_payload: null,
-        sldprt_output_path: spec.output_sldprt_path,
+        sldprt_output_path: primaryOutputPath,
         dxf_content: dxfContent,
         solidworks_spec: spec,
       };
       setMessages((prev) => [...prev, sysMsg]);
-      showToast(`Ekspor SolidWorks siap: ${spec.part_name}.sldprt (${spec.extrude_depth_mm.toFixed(1)} mm)`);
+      showToast(
+        isAsm
+          ? `Assembly SolidWorks siap: ${spec.part_name}.sldasm (${spec.parts_3d?.length ?? 0} Parts)`
+          : `Ekspor SolidWorks siap: ${spec.part_name}.sldprt (${spec.extrude_depth_mm.toFixed(1)} mm)`,
+      );
     },
     [config, showToast],
   );
 
   const handleExportSldprt = useCallback(async () => {
-    if (doc.entities.length === 0) {
-      setErrorMessage('Kanvas masih kosong. Gambar geometri 2D terlebih dahulu sebelum mengekspor .sldprt.');
+    if (doc.entities.length === 0 && doc.parts3d.length === 0) {
+      setErrorMessage(
+        'Kanvas masih kosong. Gambar geometri 2D atau generate model 3D terlebih dahulu sebelum mengekspor .sldprt.',
+      );
       return;
     }
     setErrorMessage(null);
@@ -260,9 +273,10 @@ export default function App() {
   }, [doc, executeSolidWorksExport]);
 
   const handleSendPrompt = useCallback(
-    async (promptText: string) => {
+    async (promptText: string, attachment?: PromptAttachment) => {
       setErrorMessage(null);
       setLastPrompt(promptText);
+      setLastAttachment(attachment);
       const userMsg: ChatMessage = {
         id: `usr-${Date.now()}`,
         created_at: new Date().toISOString(),
@@ -270,6 +284,7 @@ export default function App() {
         content: promptText,
         lisp_payload: null,
         sldprt_output_path: null,
+        image_preview_url: attachment?.previewUrl ?? null,
       };
       setMessages((prev) => [...prev, userMsg]);
       setIsLoading(true);
@@ -283,6 +298,8 @@ export default function App() {
             mode,
             docSummary,
             config,
+            imageBase64: attachment?.base64,
+            imageMimeType: attachment?.mimeType,
           }),
         });
         const data = await res.json();
@@ -292,21 +309,57 @@ export default function App() {
 
         const payload = data.payload;
         let workingDoc = doc;
+        let updated2d = false;
+
+        const hasParts3d = Array.isArray(payload.parts_3d) && payload.parts_3d.length > 0;
 
         if (payload.lisp_code) {
           const evalRes = evaluateAutoLisp(payload.lisp_code, workingDoc);
-          if (!evalRes.ok) {
+          if (evalRes.ok) {
+            workingDoc = evalRes.doc;
+            updated2d = true;
+            setCliLogs((l) => [...l, ...evalRes.logs]);
+          } else if (!hasParts3d) {
             throw new Error(`Sintaks AutoLISP ditolak engine: ${evalRes.error}`);
+          } else {
+            setCliLogs((l) => [
+              ...l,
+              `INFO: Proyeksi 2D diturunkan otomatis dari 3D Assembly (${evalRes.error}).`,
+            ]);
           }
-          workingDoc = evalRes.doc;
-          setCliLogs((l) => [...l, ...evalRes.logs]);
         } else if (Array.isArray(payload.commands) && payload.commands.length > 0) {
           const cmdRes = executeCmdlineList(payload.commands, workingDoc);
-          if (!cmdRes.ok) {
+          if (cmdRes.ok) {
+            workingDoc = cmdRes.doc;
+            updated2d = true;
+            setCliLogs((l) => [...l, ...cmdRes.logs]);
+          } else if (!hasParts3d) {
             throw new Error(`Perintah CAD ditolak engine: ${cmdRes.error}`);
           }
-          workingDoc = cmdRes.doc;
-          setCliLogs((l) => [...l, ...cmdRes.logs]);
+        }
+
+        const resolvedMates = Array.isArray(payload.mates) ? payload.mates : [];
+        if (hasParts3d) {
+          const syncedEntities =
+            updated2d || workingDoc.entities.length > 0
+              ? workingDoc.entities
+              : derive2dEntitiesFromParts3d(payload.parts_3d, workingDoc.activeLayer);
+          workingDoc = {
+            ...workingDoc,
+            entities: syncedEntities,
+            parts3d: payload.parts_3d,
+            mates: resolvedMates,
+          };
+          setCliLogs((l) => [
+            ...l,
+            `3D ASSEMBLY: ${payload.parts_3d.length} komponen solid & ${resolvedMates.length} mates dimuat ke 3D SolidView.`,
+          ]);
+        } else if (updated2d) {
+          workingDoc = {
+            ...workingDoc,
+            parts3d: [],
+            mates: [],
+          };
         }
 
         if (payload.solidworks_spec) {
@@ -330,7 +383,12 @@ export default function App() {
         };
         setMessages((prev) => [...prev, assistantMsg]);
 
-        if (payload.action_type === 'solidworks_3d' && workingDoc.entities.length > 0) {
+        const hasGeometry = workingDoc.entities.length > 0 || workingDoc.parts3d.length > 0;
+        if ((payload.action_type === 'solidworks_3d' || hasParts3d) && hasGeometry) {
+          setActiveView('solidworks_3d');
+        }
+
+        if (payload.action_type === 'solidworks_3d' && hasGeometry) {
           await executeSolidWorksExport(workingDoc, {
             partName: payload.solidworks_spec?.part_name,
             extrudeDepthMm: payload.solidworks_spec?.extrude_depth_mm,
@@ -355,7 +413,7 @@ export default function App() {
         return prev;
       }
       setCliLogs((l) => [...l, ...evalRes.logs]);
-      return evalRes.doc;
+      return { ...evalRes.doc, parts3d: [], mates: [] };
     });
   }, []);
 
@@ -609,6 +667,45 @@ export default function App() {
                       </div>
                     )}
                   </div>
+
+                  {doc.parts3d.length > 0 && (
+                    <div>
+                      <h2 className="text-[15px] font-semibold text-[#F1F5F9]">
+                        3D Feature Tree ({doc.parts3d.length} Parts)
+                      </h2>
+                      <div className="mt-2 overflow-hidden rounded-lg border border-[#2E3440] bg-[#1B1E23]">
+                        <table className="w-full text-left text-xs">
+                          <thead className="border-b border-[#2E3440] text-[#94A3B8]">
+                            <tr>
+                              <th className="px-4 py-2.5 font-medium">Part Name</th>
+                              <th className="px-4 py-2.5 font-medium">Type</th>
+                              <th className="px-4 py-2.5 font-medium">Finish</th>
+                              <th className="px-4 py-2.5 font-medium">Dimensions / Placement (mm)</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-[#2E3440] font-mono tabular-nums">
+                            {doc.parts3d.map((part) => (
+                              <tr key={part.id} className="hover:bg-[#242830]/60">
+                                <td className="px-4 py-2 text-[#F1F5F9]">{part.name}</td>
+                                <td className="px-4 py-2 text-[#E11D48]">{part.kind}</td>
+                                <td className="px-4 py-2 text-[#94A3B8]">{part.finish ?? 'default'}</td>
+                                <td className="px-4 py-2 text-[#F1F5F9]">
+                                  {part.kind === 'plate' &&
+                                    `${part.width}×${part.depth}×${part.height} @ Z=${part.z_min}${part.holes?.length ? ` (${part.holes.length} holes)` : ''}`}
+                                  {part.kind === 'box' &&
+                                    `${part.width}×${part.depth}×${part.height} @ (${part.cx}, ${part.cy}, Z=${part.z_min})`}
+                                  {part.kind === 'prism' &&
+                                    `${part.points.length} pts, H=${part.height} @ Z=${part.z_min}${part.holes?.length ? ` (${part.holes.length} holes)` : ''}`}
+                                  {part.kind === 'cylinder' &&
+                                    `Ø${(part.radius * 2).toFixed(1)}×L${part.length} axis=${part.axis.toUpperCase()} @ (${part.cx}, ${part.cy}, ${part.cz})${part.threaded ? ' [threaded]' : ''}`}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -632,7 +729,7 @@ export default function App() {
                 onResizeWidth={setAiPanelWidth}
                 onSendPrompt={handleSendPrompt}
                 onRetryLast={() => {
-                  if (lastPrompt) handleSendPrompt(lastPrompt);
+                  if (lastPrompt) handleSendPrompt(lastPrompt, lastAttachment);
                 }}
                 onExportSldprt={handleExportSldprt}
                 onRunLisp={handleRunLisp}
@@ -658,16 +755,16 @@ export default function App() {
           />
         )}
 
-        {/* Toast Notification (slideInUp) */}
+        {/* Toast Notification (top-center, clear of 3D bottom control dock) */}
         <AnimatePresence>
           {toastMessage && (
             <motion.div
               role="status"
-              initial={{ opacity: 0, y: 12 }}
+              initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 12 }}
+              exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.15 }}
-              className="fixed bottom-16 left-4 z-40 flex items-center gap-2 rounded-md border border-[#10B981]/50 bg-[#1B1E23] px-3.5 py-2.5 text-xs font-medium text-[#F1F5F9] shadow-lg"
+              className="fixed top-28 right-[380px] z-40 flex items-center gap-2 rounded-md border border-[#10B981]/50 bg-[#1B1E23] px-3.5 py-2 text-xs font-medium text-[#F1F5F9] shadow-lg max-md:right-4"
             >
               <CheckCircle2 className="h-4 w-4 shrink-0 text-[#10B981]" />
               <span>{toastMessage}</span>

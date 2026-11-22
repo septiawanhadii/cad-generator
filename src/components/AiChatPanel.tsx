@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Copy,
   Download,
+  ImagePlus,
   Loader2,
   Play,
   RefreshCw,
@@ -13,6 +14,7 @@ import {
   Settings,
   Trash2,
   WifiOff,
+  X,
 } from 'lucide-react';
 import type {
   AssistantTargetMode,
@@ -20,6 +22,13 @@ import type {
   DocSummary,
   SwBridgeStatus,
 } from '../types/cadcraft';
+
+export interface PromptAttachment {
+  base64: string;
+  mimeType: string;
+  previewUrl: string;
+  name?: string;
+}
 
 interface AiChatPanelProps {
   messages: ChatMessage[];
@@ -31,7 +40,7 @@ interface AiChatPanelProps {
   errorMessage: string | null;
   widthPx: number;
   onResizeWidth: (nextWidth: number) => void;
-  onSendPrompt: (prompt: string) => void;
+  onSendPrompt: (prompt: string, attachment?: PromptAttachment) => void;
   onRetryLast: () => void;
   onExportSldprt: () => void;
   onRunLisp: (lispCode: string) => void;
@@ -89,9 +98,11 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
   composerInputRef,
 }) => {
   const [inputValue, setInputValue] = useState('');
+  const [attachment, setAttachment] = useState<PromptAttachment | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const scrollEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const resizingRef = useRef(false);
 
   useEffect(() => {
@@ -115,19 +126,53 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
     };
   }, [onResizeWidth]);
 
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setValidationError('Hanya file gambar (PNG, JPG, WebP) yang didukung sebagai referensi.');
+      return;
+    }
+    if (file.size > 6 * 1024 * 1024) {
+      setValidationError('Ukuran gambar referensi maksimal 6 MB.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+      const commaIdx = dataUrl.indexOf(',');
+      if (commaIdx === -1) return;
+      const base64 = dataUrl.slice(commaIdx + 1);
+      setAttachment({
+        base64,
+        mimeType: file.type || 'image/png',
+        previewUrl: dataUrl,
+        name: file.name,
+      });
+      setValidationError(null);
+    };
+    reader.readAsDataURL(file);
+  };
+
   const handleSubmit = () => {
     const trimmed = inputValue.trim();
-    if (!trimmed) {
-      setValidationError('Masukkan deskripsi desain atau perintah CAD terlebih dahulu.');
+    if (!trimmed && !attachment) {
+      setValidationError('Masukkan deskripsi desain atau lampirkan gambar referensi terlebih dahulu.');
       return;
     }
     if (trimmed.length > 4000) {
       setValidationError('Prompt melebihi batas maksimal 4.000 karakter.');
       return;
     }
+    const finalPrompt =
+      trimmed ||
+      'Analisis gambar referensi ini dan buatkan model 3D mekanik multi-komponen yang akurat sesuai proporsi gambar.';
+    const currentAttachment = attachment ?? undefined;
     setValidationError(null);
     setInputValue('');
-    onSendPrompt(trimmed);
+    setAttachment(null);
+    onSendPrompt(finalPrompt, currentAttachment);
   };
 
   const handleCopy = async (id: string, text: string) => {
@@ -208,7 +253,9 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
       <div className="border-b border-[#2E3440] bg-[#1B1E23]/60 px-3 py-2.5">
         <div className="flex items-center justify-between text-xs text-[#94A3B8] font-mono tabular-nums">
           <span className="truncate">
-            Layer: {docSummary.activeLayer} · {docSummary.entityCount} Entities · Unit: {docSummary.unit}
+            Layer: {docSummary.activeLayer} · {docSummary.entityCount} 2D
+            {(docSummary.parts3dCount ?? 0) > 0 ? ` · ${docSummary.parts3dCount} 3D Parts` : ''} ·{' '}
+            {docSummary.unit}
           </span>
           {docSummary.extents && (
             <span className="shrink-0 text-[#06B6D4]">
@@ -311,8 +358,15 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
               className={`flex flex-col ${msg.role === 'User' ? 'items-end' : 'items-start'}`}
             >
               {msg.role === 'User' && (
-                <div className="max-w-[90%] rounded-[10px] border border-[#3B82F6]/35 bg-[#2563EB]/15 px-3 py-2 text-[13px] leading-[1.45] text-[#F1F5F9]">
-                  {msg.content}
+                <div className="max-w-[90%] space-y-2 rounded-[10px] border border-[#3B82F6]/35 bg-[#2563EB]/15 px-3 py-2 text-[13px] leading-[1.45] text-[#F1F5F9]">
+                  {msg.image_preview_url && (
+                    <img
+                      src={msg.image_preview_url}
+                      alt="Referensi komponen mekanik"
+                      className="max-h-36 w-full rounded border border-[#2E3440] bg-[#121417] object-contain"
+                    />
+                  )}
+                  <p>{msg.content}</p>
                 </div>
               )}
 
@@ -441,6 +495,38 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
 
       {/* Prompt Composer Footer */}
       <div className="border-t border-[#2E3440] bg-[#1B1E23]/80 p-3">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          aria-label="Lampirkan gambar referensi 3D"
+          onChange={handleFileChange}
+          className="hidden"
+        />
+
+        {attachment && (
+          <div className="mb-2 flex items-center justify-between gap-2 rounded-md border border-[#2E3440] bg-[#121417] px-2 py-1.5">
+            <div className="flex min-w-0 items-center gap-2">
+              <img
+                src={attachment.previewUrl}
+                alt="Preview lampiran referensi"
+                className="h-9 w-9 shrink-0 rounded border border-[#2E3440] object-cover"
+              />
+              <span className="truncate text-[11px] font-mono text-[#F1F5F9]">
+                {attachment.name || 'reference-image.png'}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAttachment(null)}
+              aria-label="Hapus gambar referensi"
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-[#94A3B8] hover:bg-[#242830] hover:text-[#EF4444]"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+
         <label htmlFor="ai-prompt-composer" className="sr-only">
           CAD Design Prompt
         </label>
@@ -459,7 +545,7 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
               if (!isLoading) handleSubmit();
             }
           }}
-          placeholder="Deskripsikan geometri CAD (mm)... Enter kirim, Shift+Enter baris baru"
+          placeholder="Deskripsikan geometri CAD (mm) atau lampirkan gambar referensi..."
           className="w-full resize-none rounded-md border border-[#2E3440] bg-[#121417] px-3 py-2 text-[13px] text-[#F1F5F9] placeholder-[#94A3B8]/60 focus:border-[#3B82F6] focus:outline-none"
         />
 
@@ -472,12 +558,23 @@ export const AiChatPanel: React.FC<AiChatPanelProps> = ({
         <div className="mt-2 flex items-center justify-between gap-2">
           <button
             type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isLoading}
+            title="Lampirkan gambar referensi mekanik (PNG/JPG)"
+            aria-label="Lampirkan gambar referensi"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-[#2E3440] bg-[#121417] text-[#94A3B8] transition-colors hover:border-[#3B82F6] hover:text-[#F1F5F9] disabled:opacity-40"
+          >
+            <ImagePlus className="h-4 w-4" />
+          </button>
+
+          <button
+            type="button"
             onClick={onExportSldprt}
-            disabled={isLoading || docSummary.entityCount === 0}
+            disabled={isLoading || (docSummary.entityCount === 0 && (docSummary.parts3dCount ?? 0) === 0)}
             className="flex h-9 items-center gap-1.5 rounded-md bg-[#E11D48] px-3 text-xs font-semibold text-[#F1F5F9] transition-colors hover:bg-[#BE123C] disabled:opacity-40 whitespace-nowrap shrink-0"
           >
             <Box className="h-3.5 w-3.5" />
-            <span>Export .sldprt</span>
+            <span>{(docSummary.parts3dCount ?? 0) > 1 ? 'Export .sldasm' : 'Export .sldprt'}</span>
           </button>
 
           <button

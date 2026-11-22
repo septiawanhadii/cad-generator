@@ -5,6 +5,7 @@ import type {
   SolidWorksBuildSpec,
   SwPrimitiveEntity,
 } from '../types/cadcraft';
+import { deriveParts3dFrom2dDoc, inferAssemblyMates } from './cad3dModel';
 
 export function mmToMeters(mm: number): number {
   return mm / 1000.0;
@@ -187,17 +188,28 @@ export function buildSolidWorksSpecFromDoc(
     }
   }
 
+  const parts3d = doc.parts3d.length > 0 ? doc.parts3d : deriveParts3dFrom2dDoc(doc);
+  const mates = doc.mates.length > 0 ? doc.mates : inferAssemblyMates(parts3d);
+  const isAssembly = parts3d.length > 1;
   const baseDir = config.export_dir.replace(/[\\/]+$/, '');
   const sep = baseDir.includes('/') && !baseDir.includes('\\') ? '/' : '\\';
-  const sourceMode = overrides?.sourceMode || (entities.length > 0 && entities.length === doc.entities.length ? 'parametric_primitives' : 'from_active_dxf');
+  const sourceMode =
+    overrides?.sourceMode ||
+    (parts3d.length > 0 || (entities.length > 0 && entities.length === doc.entities.length)
+      ? 'parametric_primitives'
+      : 'from_active_dxf');
 
   return {
     part_name: partName,
+    output_mode: isAssembly ? 'assembly' : 'part',
     source_mode: sourceMode,
     dxf_temp_path: `${baseDir}${sep}${partName}_sketch.dxf`,
     extrude_depth_mm: extrudeDepthMm,
     fillet_radius_mm: filletRadiusMm,
     entities,
+    parts_3d: parts3d,
+    mates,
     output_sldprt_path: `${baseDir}${sep}${partName}.sldprt`,
+    output_sldasm_path: isAssembly ? `${baseDir}${sep}${partName}.sldasm` : null,
   };
 }
